@@ -1,16 +1,102 @@
 import { NextRequest, NextResponse } from "next/server";
 import openai, { MODEL } from "@/lib/openai";
 import { ParsedResume } from "@/lib/types";
+import mammoth from "mammoth";
+
+// Extract text from PDF using unpdf — no workers, no canvas, serverless-safe
+async function extractPdfText(buffer: Buffer): Promise<string> {
+  const { extractText } = await import("unpdf");
+  const uint8Array = new Uint8Array(buffer);
+  const { text } = await extractText(uint8Array, { mergePages: true });
+  return text;
+}
+
+// Dispatch to the right extractor based on file type
+async function extractTextFromFile(
+  buffer: Buffer,
+  mimeType: string,
+  fileName: string
+): Promise<string> {
+  const lower = fileName.toLowerCase();
+
+  if (mimeType === "application/pdf" || lower.endsWith(".pdf")) {
+    return extractPdfText(buffer);
+  }
+
+  if (
+    mimeType ===
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+    lower.endsWith(".docx")
+  ) {
+    const result = await mammoth.extractRawText({ buffer });
+    return result.value;
+  }
+
+  // Plain text / TXT
+  return buffer.toString("utf-8");
+}
 
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
-    const resumeText = formData.get("resumeText") as string;
     const jobDescription = formData.get("jobDescription") as string;
 
-    if (!resumeText || !jobDescription) {
+    if (!jobDescription?.trim()) {
       return NextResponse.json(
-        { error: "Resume text and job description are required." },
+        { error: "Job description is required." },
+        { status: 400 }
+      );
+    }
+
+    let resumeText = "";
+    const resumeFile = formData.get("resumeFile") as File | null;
+    const resumeTextRaw = formData.get("resumeText") as string | null;
+
+    if (resumeFile && resumeFile.size > 0) {
+      const allowedTypes = [
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "text/plain",
+      ];
+      const allowedExtensions = [".pdf", ".docx", ".txt"];
+      const ext = resumeFile.name
+        .toLowerCase()
+        .slice(resumeFile.name.lastIndexOf("."));
+
+      if (
+        !allowedTypes.includes(resumeFile.type) &&
+        !allowedExtensions.includes(ext)
+      ) {
+        return NextResponse.json(
+          { error: "Unsupported file. Please upload PDF, DOCX, or TXT." },
+          { status: 400 }
+        );
+      }
+
+      if (resumeFile.size > 5 * 1024 * 1024) {
+        return NextResponse.json(
+          { error: "File too large. Maximum 5MB." },
+          { status: 400 }
+        );
+      }
+
+      const arrayBuffer = await resumeFile.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      resumeText = await extractTextFromFile(
+        buffer,
+        resumeFile.type,
+        resumeFile.name
+      );
+    } else if (resumeTextRaw?.trim()) {
+      resumeText = resumeTextRaw;
+    }
+
+    if (!resumeText.trim()) {
+      return NextResponse.json(
+        {
+          error:
+            "Could not extract text from resume. Try a different file or paste text directly.",
+        },
         { status: 400 }
       );
     }
@@ -18,10 +104,10 @@ export async function POST(req: NextRequest) {
     const prompt = `You are an expert HR analyst and technical recruiter. Analyze the following resume against the job description.
 
 RESUME:
-${resumeText}
+${resumeText.slice(0, 6000)}
 
 JOB DESCRIPTION:
-${jobDescription}
+${jobDescription.slice(0, 3000)}
 
 Return a JSON object with exactly this structure:
 {
@@ -41,9 +127,13 @@ Only return valid JSON, no markdown, no extra text.`;
     });
 
     const content = response.choices[0].message.content || "{}";
-    const parsed: ParsedResume = JSON.parse(content);
+    const cleaned = content
+      .replace(/^```[a-z]*\n?/i, "")
+      .replace(/```$/, "")
+      .trim();
+    const parsed: ParsedResume = JSON.parse(cleaned);
 
-    return NextResponse.json({ parsedResume: parsed });
+    return NextResponse.json({ parsedResume: parsed, resumeText });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Unknown error";
     console.error("Parse resume error:", message);
