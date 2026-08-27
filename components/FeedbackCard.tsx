@@ -3,12 +3,38 @@
 import { useState } from "react";
 import { Feedback } from "@/lib/types";
 
+function formatModelAnswer(answer: string): Array<{ type: "heading" | "point"; text: string }> {
+  const sections: Array<{ type: "heading" | "point"; text: string }> = [];
+
+  answer
+    .split(/\r?\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .forEach((line) => {
+      const isBullet = /^[-*•]\s+/.test(line);
+      const text = line.replace(/^[-*•]\s+/, "").trim();
+
+      if (!isBullet && /:$/.test(text)) {
+        sections.push({ type: "heading", text: text.slice(0, -1).trim() });
+        return;
+      }
+
+      const points = isBullet ? [text] : text.split(/(?<=[.!?])\s+(?=[A-Z0-9])/);
+      points.forEach((point) => {
+        if (point.trim()) sections.push({ type: "point", text: point.trim() });
+      });
+    });
+
+  return sections.length > 0 ? sections : [{ type: "point", text: answer }];
+}
+
 interface Props {
   feedback: Feedback;
 }
 
 export default function FeedbackCard({ feedback }: Props) {
   const [showModel, setShowModel] = useState(false);
+  const modelAnswerSections = formatModelAnswer(feedback.modelAnswer || "No model answer available.");
 
   const verdictConfig = {
     strong: {
@@ -112,7 +138,20 @@ export default function FeedbackCard({ feedback }: Props) {
 
       {showModel && (
         <div className="mt-3 p-4 bg-indigo-500/5 border border-indigo-500/10 rounded-xl">
-          <p className="text-sm text-white/70 leading-relaxed">{feedback.modelAnswer}</p>
+          <div className="space-y-3">
+            {modelAnswerSections.map((section, index) =>
+              section.type === "heading" ? (
+                <h5 key={`${section.text}-${index}`} className="text-xs font-semibold uppercase tracking-wider text-indigo-300">
+                  {section.text}
+                </h5>
+              ) : (
+                <div key={`${section.text}-${index}`} className="flex gap-3 text-sm text-white/70 leading-relaxed">
+                  <span className="text-indigo-400 shrink-0">•</span>
+                  <p>{section.text}</p>
+                </div>
+              )
+            )}
+          </div>
         </div>
       )}
     </div>

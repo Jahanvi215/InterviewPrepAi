@@ -2,6 +2,31 @@ import { NextRequest, NextResponse } from "next/server";
 import openai, { MODEL } from "@/lib/openai";
 import { Feedback, Question } from "@/lib/types";
 
+function extractJsonObject(raw: string): string {
+  const cleaned = raw.replace(/^```[a-z]*\s*/i, "").replace(/\s*```$/i, "").trim();
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  return start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned;
+}
+
+async function callWithRetry<T>(fn: () => Promise<T>, retries = 3): Promise<T> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : "";
+      const isRateLimited = message.includes("429") || message.toLowerCase().includes("rate limit");
+      if (!isRateLimited || attempt === retries) throw error;
+
+      const delay = Math.pow(2, attempt + 1) * 1000;
+      console.log(`Rate limited on evaluate-answer. Retrying in ${delay / 1000}s...`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+
+  throw new Error("Max retries exceeded");
+}
+
 export async function POST(req: NextRequest) {
   try {
     const { question, answer, jobDescription } = await req.json() as {
@@ -51,19 +76,37 @@ verdict rules:
 
 Only return valid JSON, no markdown, no extra text.`;
 
-    const response = await openai.chat.completions.create({
-      model: MODEL,
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.3,
-    });
+    const feedback = await callWithRetry(async () => {
+      const response = await openai.chat.completions.create({
+        model: MODEL,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.3,
+        response_format: { type: "json_object" },
+      });
 
-    const content = response.choices[0].message.content || "{}";
-    const feedback: Feedback = JSON.parse(content);
+      const content = response.choices[0].message.content || "{}";
+      const json = extractJsonObject(content);
+      if (!json.startsWith("{")) {
+        throw new Error("AI provider returned a non-JSON evaluation response");
+      }
+      return JSON.parse(json) as Feedback;
+    });
 
     return NextResponse.json({ feedback });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Unknown error";
     console.error("Evaluate answer error:", message);
-    return NextResponse.json({ error: message }, { status: 500 });
+    const isRateLimited = message.includes("429") || message.toLowerCase().includes("rate limit");
+    const isInvalidModelResponse = message.includes("non-JSON evaluation response") || message.includes("Unexpected token");
+    return NextResponse.json(
+      {
+        error: isRateLimited
+          ? "AI provider rate limit reached. Please wait a moment and try again."
+          : isInvalidModelResponse
+            ? "The AI provider returned an invalid evaluation. Please submit your answer again."
+            : message,
+      },
+      { status: isRateLimited ? 429 : isInvalidModelResponse ? 502 : 500 }
+    );
   }
 }

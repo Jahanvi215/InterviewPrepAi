@@ -28,7 +28,6 @@ export default function ResultsPage() {
     setLoading(true);
     if (isRetry) setError("");
 
-    // If rate limited, wait 5s before retrying
     if (isRetry) {
       await new Promise((res) => setTimeout(res, 5000));
     }
@@ -46,6 +45,21 @@ export default function ResultsPage() {
       const result = await res.json();
       if (!res.ok) throw new Error(result.error || "Summary failed");
       setSummary(result.summary);
+
+      // Persist session to MongoDB (fire-and-forget, don't block UI)
+      fetch("/api/sessions/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jobDescription: data.jobDescription,
+          parsedResume: data.parsedResume,
+          questions: data.questions,
+          answers: data.answers,
+          feedbacks: data.feedbacks,
+          summary: result.summary,
+        }),
+      }).catch(() => {/* user may not be logged in — that's fine */});
+
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Something went wrong";
       setError(message);

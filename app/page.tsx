@@ -1,11 +1,13 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { useRouter } from "next/navigation";
+import { useSession } from "next-auth/react";
 import { ParsedResume } from "@/lib/types";
 
 export default function HomePage() {
   const router = useRouter();
+  const { data: session, status } = useSession();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [resumeFile, setResumeFile] = useState<File | null>(null);
@@ -14,6 +16,16 @@ export default function HomePage() {
   const [error, setError] = useState("");
   const [step, setStep] = useState<"idle" | "parsing" | "generating">("idle");
   const [dragOver, setDragOver] = useState(false);
+
+  // ── Restore pending JD after sign-in ────────────────────────────
+  useEffect(() => {
+    if (status !== "authenticated") return;
+    const pending = sessionStorage.getItem("pendingJobDescription");
+    if (pending) {
+      setJobDescription(pending);
+      sessionStorage.removeItem("pendingJobDescription");
+    }
+  }, [status]);
 
   // ── File validation ──────────────────────────────────────────────
   const validateAndSetFile = (file: File) => {
@@ -77,6 +89,14 @@ export default function HomePage() {
       setError("Please paste the job description.");
       return;
     }
+
+    // ── Auth gate: save JD and redirect to sign-in ───────────────
+    if (!session) {
+      sessionStorage.setItem("pendingJobDescription", jobDescription);
+      router.push("/sign-in?next=/");
+      return;
+    }
+
     setError("");
     setLoading(true);
     setStep("parsing");
@@ -106,7 +126,6 @@ export default function HomePage() {
       });
       const questionsData = await questionsRes.json();
       if (!questionsRes.ok) throw new Error(questionsData.error || "Failed to generate questions");
-
       // Store session in sessionStorage
       sessionStorage.setItem(
         "interviewSession",

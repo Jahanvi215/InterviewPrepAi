@@ -36,6 +36,24 @@ async function extractTextFromFile(
   return buffer.toString("utf-8");
 }
 
+async function callWithRetry<T>(fn: () => Promise<T>, retries = 3): Promise<T> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : "";
+      const isRateLimited = message.includes("429") || message.toLowerCase().includes("rate limit");
+      if (!isRateLimited || attempt === retries) throw error;
+
+      const delay = Math.pow(2, attempt + 1) * 1000;
+      console.log(`Rate limited on parse-resume. Retrying in ${delay / 1000}s...`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+
+  throw new Error("Max retries exceeded");
+}
+
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
@@ -82,11 +100,13 @@ export async function POST(req: NextRequest) {
 
       const arrayBuffer = await resumeFile.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
+      console.log("Extracting text from file:", resumeFile.name, resumeFile.type, buffer.length, "bytes");
       resumeText = await extractTextFromFile(
         buffer,
         resumeFile.type,
         resumeFile.name
       );
+      console.log("Extracted text length:", resumeText.length);
     } else if (resumeTextRaw?.trim()) {
       resumeText = resumeTextRaw;
     }
@@ -120,23 +140,30 @@ Return a JSON object with exactly this structure:
 
 Only return valid JSON, no markdown, no extra text.`;
 
-    const response = await openai.chat.completions.create({
-      model: MODEL,
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.3,
-    });
+    const parsed = await callWithRetry(async () => {
+      const response = await openai.chat.completions.create({
+        model: MODEL,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.3,
+      });
 
-    const content = response.choices[0].message.content || "{}";
-    const cleaned = content
-      .replace(/^```[a-z]*\n?/i, "")
-      .replace(/```$/, "")
-      .trim();
-    const parsed: ParsedResume = JSON.parse(cleaned);
+      const content = response.choices[0].message.content || "{}";
+      const cleaned = content
+        .replace(/^```[a-z]*\n?/i, "")
+        .replace(/```$/, "")
+        .trim();
+      return JSON.parse(cleaned) as ParsedResume;
+    });
 
     return NextResponse.json({ parsedResume: parsed, resumeText });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Unknown error";
-    console.error("Parse resume error:", message);
-    return NextResponse.json({ error: message }, { status: 500 });
+    const stack = error instanceof Error ? error.stack?.split("\n").slice(0,3).join(" | ") : "";
+    console.error("Parse resume error:", message, stack);
+    const isRateLimited = message.includes("429") || message.toLowerCase().includes("rate limit");
+    return NextResponse.json(
+      { error: isRateLimited ? "AI provider rate limit reached. Please wait a moment and try again." : message },
+      { status: isRateLimited ? 429 : 500 }
+    );
   }
 }
